@@ -19,15 +19,13 @@
 #include "src/rules/rules.h"
 
 #include "webfunctions.h"
-#include "decode.h"
+#include "decoder/decode.h"
+#include "crash_helper/crash_helper.h"
 #include "commands.h"
 #include "rules.h"
 #include "version.h"
 
 DNSServer dnsServer;
-
-//to read bus voltage in stats
-ADC_MODE(ADC_VCC);
 
 // maximum number of seconds between resets that
 // counts as a double reset
@@ -44,13 +42,13 @@ const byte DNS_PORT = 53;
 
 settingsStruct heishamonSettings;
 
-bool sending = false; // mutex for sending data
+bool sending = false;                // mutex for sending data
 bool mqttcallbackinprogress = false; // mutex for processing mqtt callback
 
 bool extraDataBlockAvailable = false; // this will be set to true if, during boot, heishamon detects this heatpump has extra data block (like K and L series do)
 bool extraDataBlockChecked = false; // this will be true if we already checked for the extra data block
 
-#define MQTTRECONNECTTIMER 30000 //it takes 30 secs for each mqtt server reconnect attempt
+#define MQTTRECONNECTTIMER 30000 // it takes 30 secs for each mqtt server reconnect attempt
 unsigned long lastMqttReconnectAttempt = 0;
 
 #define WIFIRETRYTIMER 15000 // switch between hotspot and configured SSID each 10 secs if SSID is lost
@@ -60,7 +58,7 @@ unsigned long lastRunTime = 0;
 unsigned long lastOptionalPCBRunTime = 0;
 unsigned long lastOptionalPCBSave = 0;
 
-unsigned long sendCommandReadTime = 0; //set to millis value during send, allow to wait millis for answer
+unsigned long sendCommandReadTime = 0; // set to millis value during send, allow to wait millis for answer
 unsigned long goodreads = 0;
 unsigned long totalreads = 0;
 unsigned long badcrcread = 0;
@@ -72,16 +70,14 @@ float readpercentage = 0;
 static int uploadpercentage = 0;
 
 // instead of passing array pointers between functions we just define this in the global scope
-#define MAXDATASIZE 255
-char data[MAXDATASIZE] = { '\0' };
-byte data_length = 0;
+char serial_read_buffer[DECODE_MAX_BUFFER_SIZE] = { '\0' };
+byte serial_read_buffer_length = 0;
 
 // store actual data
 String openTherm[2];
-char actData[DATASIZE] = { '\0' };
-char actDataExtra[DATASIZE] = { '\0' };
-#define OPTDATASIZE 20
-char actOptData[OPTDATASIZE]  = { '\0' };
+char serial_decoder_buffer[DECODE_REGULAR_DATAGRAM_SIZE] = { '\0' };
+char last_transmitted_buffer[DECODE_REGULAR_DATAGRAM_SIZE] = { '\0' };
+char serial_decoder_opt_buffer[DECODE_OPT_DATAGRAM_SIZE] = { '\0' };
 String RESTmsg = "";
 
 // log message to sprintf to
@@ -96,7 +92,8 @@ static int mqttReconnects = 0;
 #define MAXCOMMANDSINBUFFER 10
 
 // buffer for commands to send
-struct cmdbuffer_t {
+struct cmdbuffer_t
+{
   uint8_t length;
   byte data[128];
 } cmdbuffer[MAXCOMMANDSINBUFFER];
@@ -105,14 +102,16 @@ static uint8_t cmdstart = 0;
 static uint8_t cmdend = 0;
 static uint8_t cmdnrel = 0;
 
-//doule reset detection
+// doule reset detection
 DoubleResetDetect drd(DRD_TIMEOUT, DRD_ADDRESS);
 
 // mqtt
 WiFiClient mqtt_wifi_client;
 PubSubClient mqtt_client(mqtt_wifi_client);
 
-bool firstConnectSinceBoot = true; //if this is true there is no first connection made yet
+bool has_unsent_topics = false;
+
+bool firstConnectSinceBoot = true; // if this is true there is no first connection made yet
 
 struct timerqueue_t **timerqueue = NULL;
 int timerqueue_size = 0;
@@ -123,11 +122,12 @@ int timerqueue_size = 0;
 */
 void check_wifi()
 {
-  if ((WiFi.status() != WL_CONNECTED) && (WiFi.localIP()))  {
+  if ((WiFi.status() != WL_CONNECTED) && (WiFi.localIP())) {
     // special case where it seems that we are not connect but we do have working IP (causing the -1% wifi signal), do a reset.
     log_message(_F("Weird case, WiFi seems disconnected but is not. Resetting WiFi!"));
     setupWifi(&heishamonSettings);
-  } else if ((WiFi.status() != WL_CONNECTED) || (!WiFi.localIP()))  {
+  }
+  else if ((WiFi.status() != WL_CONNECTED) || (!WiFi.localIP())) {
     /*
         if we are not connected to an AP
         we must be in softAP so respond to DNS
@@ -137,54 +137,57 @@ void check_wifi()
     /* we need to stop reconnecting to a configured wifi network if there is a hotspot user connected
         also, do not disconnect if wifi network scan is active
     */
-    if ((heishamonSettings.wifi_ssid[0] != '\0') && (WiFi.status() != WL_DISCONNECTED) && (WiFi.scanComplete() != -1) && (WiFi.softAPgetStationNum() > 0))  {
-      log_message(_F("WiFi lost, but softAP station connecting, so stop trying to connect to configured ssid..."));
+    if ((heishamonSettings.wifi_ssid[0] != '\0') && (WiFi.status() != WL_DISCONNECTED) && (WiFi.scanComplete() != -1) && (WiFi.softAPgetStationNum() > 0)) {
+      log_message(F("WiFi lost, but softAP station connecting, so stop trying to connect to configured ssid..."));
       WiFi.disconnect(true);
     }
 
     /*  only start this routine if timeout on
         reconnecting to AP and SSID is set
     */
-    if ((heishamonSettings.wifi_ssid[0] != '\0') && ((unsigned long)(millis() - lastWifiRetryTimer) > WIFIRETRYTIMER ) )  {
+    if ((heishamonSettings.wifi_ssid[0] != '\0') && ((unsigned long)(millis() - lastWifiRetryTimer) > WIFIRETRYTIMER)) {
       lastWifiRetryTimer = millis();
       if (WiFi.softAPSSID() == "") {
-        log_message(_F("WiFi lost, starting setup hotspot..."));
-        WiFi.softAP((char*)"HeishaMon-Setup");
+        log_message(F("WiFi lost, starting setup hotspot..."));
+        WiFi.softAP((char *)"HeishaMon-Setup");
       }
-      if ((WiFi.status() == WL_DISCONNECTED)  && (WiFi.softAPgetStationNum() == 0 )) {
-        log_message(_F("Retrying configured WiFi, ..."));
+      if ((WiFi.status() == WL_DISCONNECTED) && (WiFi.softAPgetStationNum() == 0)) {
+        log_message(F("Retrying configured WiFi, ..."));
         if (heishamonSettings.wifi_password[0] == '\0') {
           WiFi.begin(heishamonSettings.wifi_ssid);
-        } else {
+        }
+        else {
           WiFi.begin(heishamonSettings.wifi_ssid, heishamonSettings.wifi_password);
         }
-      } else {
-        log_message(_F("Reconnecting to WiFi failed. Waiting a few seconds before trying again."));
+      }
+      else {
+        log_message(F("Reconnecting to WiFi failed. Waiting a few seconds before trying again."));
         WiFi.disconnect(true);
       }
     }
-  } else { //WiFi connected
+  }
+  else { // WiFi connected
     if (WiFi.softAPSSID() != "") {
-      log_message(_F("WiFi (re)connected, shutting down hotspot..."));
+      log_message(F("WiFi (re)connected, shutting down hotspot..."));
       WiFi.softAPdisconnect(true);
       MDNS.notifyAPChange();
     }
 
     if (firstConnectSinceBoot) { // this should start only when softap is down or else it will not work properly so run after the routine to disable softap
       firstConnectSinceBoot = false;
-      lastMqttReconnectAttempt = 0; //initiate mqtt connection asap
+      lastMqttReconnectAttempt = 0; // initiate mqtt connection asap
       setupOTA();
       MDNS.begin(heishamonSettings.wifi_hostname);
       MDNS.addService("http", "tcp", 80);
-      experimental::ESP8266WiFiGratuitous::stationKeepAliveSetIntervalMs(5000); //necessary for some users with bad wifi routers
+      experimental::ESP8266WiFiGratuitous::stationKeepAliveSetIntervalMs(5000); // necessary for some users with bad wifi routers
 
       if (heishamonSettings.wifi_ssid[0] == '\0') {
-        log_message(_F("WiFi connected without SSID and password in settings. Must come from persistent memory. Storing in settings."));
+        log_message(F("WiFi connected without SSID and password in settings. Must come from persistent memory. Storing in settings."));
         WiFi.SSID().toCharArray(heishamonSettings.wifi_ssid, 40);
         WiFi.psk().toCharArray(heishamonSettings.wifi_password, 40);
         DynamicJsonDocument jsonDoc(1024);
-        settingsToJson(jsonDoc, &heishamonSettings); //stores current settings in a json document
-        saveJsonToConfig(jsonDoc); //save to config file
+        settingsToJson(jsonDoc, &heishamonSettings); // stores current settings in a json document
+        saveJsonToConfig(jsonDoc);                   // save to config file
       }
 
       ntpReload(&heishamonSettings);
@@ -204,18 +207,15 @@ void check_wifi()
 void mqtt_reconnect()
 {
   unsigned long now = millis();
-  if ((lastMqttReconnectAttempt == 0) || ((unsigned long)(now - lastMqttReconnectAttempt) > MQTTRECONNECTTIMER)) { //only try reconnect each MQTTRECONNECTTIMER seconds or on boot when lastMqttReconnectAttempt is still 0
+  if ((lastMqttReconnectAttempt == 0) || ((unsigned long)(now - lastMqttReconnectAttempt) > MQTTRECONNECTTIMER)) { // only try reconnect each MQTTRECONNECTTIMER seconds or on boot when lastMqttReconnectAttempt is still 0
     lastMqttReconnectAttempt = now;
-    log_message(_F("Reconnecting to mqtt server ..."));
+    log_message(F("Reconnecting to mqtt server ..."));
     char topic[256];
     sprintf(topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_willtopic);
-    if (mqtt_client.connect(heishamonSettings.wifi_hostname, heishamonSettings.mqtt_username, heishamonSettings.mqtt_password, topic, 1, true, "Offline"))
-    {
+    if (mqtt_client.connect(heishamonSettings.wifi_hostname, heishamonSettings.mqtt_username, heishamonSettings.mqtt_password, topic, 1, true, "Offline")) {
       mqttReconnects++;
-      if (heishamonSettings.opentherm) {
-        sprintf(topic, "%s/%s/#", heishamonSettings.mqtt_topic_base, mqtt_topic_opentherm);
-        mqtt_client.subscribe(topic);
-      }
+
+      mqtt_client.subscribe("panasonic_heat_pump/opentherm/#");
       sprintf(topic, "%s/%s/#", heishamonSettings.mqtt_topic_base, mqtt_topic_commands);
       mqtt_client.subscribe(topic);
       sprintf(topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_send_raw_value_topic);
@@ -231,23 +231,30 @@ void mqtt_reconnect()
         sprintf_P(mqtt_topic, PSTR("%s/%s/WatthourTotal/2"), heishamonSettings.mqtt_topic_base, mqtt_topic_s0);
         mqtt_client.subscribe(mqtt_topic);
       }
-      if (mqttReconnects == 1) { //only resend all data on first connect to mqtt so a data bomb like and bad mqtt server will not cause a reconnect bomb everytime
-        if (heishamonSettings.use_1wire) resetlastalldatatime_dallas(); //resend all 1wire values to mqtt
-        resetlastalldatatime(); //resend all heatpump values to mqtt
+      if (mqttReconnects == 1) { // only resend all data on first connect to mqtt so a data bomb like and bad mqtt server will not cause a reconnect bomb everytime
+        if (heishamonSettings.use_1wire)
+          resetlastalldatatime_dallas(); // resend all 1wire values to mqtt
       }
-      //use this to receive valid heishamon raw data from other heishamon to debug this OT code
-#define OTDEBUG
-#ifdef OTDEBUG
-      if ( heishamonSettings.listenonly && heishamonSettings.listenmqtt ) {
-        sprintf(topic, "%s/raw/data", heishamonSettings.mqtt_topic_listen);
-        mqtt_client.subscribe(topic); //subscribe to raw heatpump data over MQTT
-      }
-#endif
     }
   }
 }
 
-void log_message(char* string)
+void log_message(const __FlashStringHelper *msg)
+{
+  PGM_P p = (PGM_P)msg;
+  int len = strlen_P((const char *)p);
+  char *str = (char *)MALLOC(len + 1);
+  if (str == NULL) {
+    OUT_OF_MEMORY
+  }
+  strcpy_P(str, p);
+
+  log_message(str);
+
+  FREE(str);
+}
+
+void log_message(char *string)
 {
   time_t rawtime;
   rawtime = time(NULL);
@@ -255,14 +262,13 @@ void log_message(char* string)
   char timestring[32];
   strftime(timestring, 32, "%c", timeinfo);
   size_t len = strlen(string) + strlen(timestring) + 20; //+20 long enough to contain millis()
-  char* log_line = (char *) malloc(len);
+  char *log_line = (char *)malloc(len);
   snprintf(log_line, len, "%s (%lu): %s", timestring, millis(), string);
 
   if (heishamonSettings.logSerial1) {
     Serial1.println(log_line);
   }
-  if (heishamonSettings.logMqtt && mqtt_client.connected())
-  {
+  if (heishamonSettings.logMqtt && mqtt_client.connected()) {
     char log_topic[256];
     sprintf(log_topic, "%s/%s", heishamonSettings.mqtt_topic_base, mqtt_logtopic);
 
@@ -279,130 +285,224 @@ void log_message(char* string)
   free(log_line);
 }
 
-void logHex(char *hex, byte hex_len) {
-#define LOGHEXBYTESPERLINE 32  // please be aware of max mqtt message size
+void logHex(char *hex, byte hex_len)
+{
+#define LOGHEXBYTESPERLINE 32 // please be aware of max mqtt message size
   for (int i = 0; i < hex_len; i += LOGHEXBYTESPERLINE) {
-    char buffer [(LOGHEXBYTESPERLINE * 3) + 1];
+    char buffer[(LOGHEXBYTESPERLINE * 3) + 1];
     buffer[LOGHEXBYTESPERLINE * 3] = '\0';
     for (int j = 0; ((j < LOGHEXBYTESPERLINE) && ((i + j) < hex_len)); j++) {
       sprintf(&buffer[3 * j], "%02X ", hex[i + j]);
     }
-    sprintf_P(log_msg, PSTR("data: %s"), buffer ); log_message(log_msg);
+    sprintf_P(log_msg, PSTR("data: %s"), buffer);
+    log_message(log_msg);
   }
 }
 
-void mqttPublish(char* topic, char* subtopic, char* value) {
-  char mqtt_topic[256];
-  sprintf_P(mqtt_topic, PSTR("%s/%s/%s"), heishamonSettings.mqtt_topic_base, topic, subtopic);
-  mqtt_client.publish(mqtt_topic, value, MQTT_RETAIN_VALUES);
+#define MQTT_RETAIN_VALUES 0
+
+
+void publish_crash_report() {
+  char topic_buffer[128];
+  const bool mqtt_connected = WiFi.isConnected() && mqtt_client.state() == MQTT_CONNECTED;
+
+  if (mqtt_connected == false) {
+    return;
+  }
+
+
+  if (crash_helper_has_crashed()) {
+    static char crash_log_buffer[1024];
+    crash_helper_print_crash(crash_log_buffer, sizeof(crash_log_buffer));
+    snprintf(topic_buffer, sizeof(topic_buffer), "%s/%s/%s", heishamonSettings.mqtt_topic_base, mqtt_topic_values, "crash_dump");
+    const bool publised_crash = mqtt_client.publish(topic_buffer, crash_log_buffer, true);
+
+    if (publised_crash) {
+      crash_helper_clear_crash();
+    }
+  }
 }
 
+void publish_available_data()
+{
+  static unsigned long lastalldatatime = 0;
 
+  decode_result_t latest_result;
+  decode_result_t last_transmitted_result;
 
-byte calcChecksum(byte* command, int length) {
+  char topic_buffer[128];
+  char result_str[32];
+  bool force_update_all = false;
+  const bool mqtt_connected = WiFi.isConnected() && mqtt_client.state() == MQTT_CONNECTED;
+
+  if (has_unsent_topics == false) {
+    // No new data to transmit.
+    return;
+  }
+
+  if ((lastalldatatime == 0) || ((unsigned long)(millis() - lastalldatatime) > (1000 * heishamonSettings.updateAllTime))) {
+    force_update_all = true;
+  }
+
+  for (uint8_t topic = 0; topic < HEATPUMP_TOPIC_Last; topic++) {
+    decode_get_topic_value((heatpump_topic_t)topic, (uint8_t *)serial_decoder_buffer, &latest_result, false);
+    decode_get_topic_value((heatpump_topic_t)topic, (uint8_t *)last_transmitted_buffer, &last_transmitted_result, false);
+
+    if (mqtt_connected == false) {
+      decode_topic_update_value_filter((heatpump_topic_t)topic, latest_result.float_value);
+      continue;
+    }
+
+    if (decode_result_compare_equal(&latest_result, &last_transmitted_result) && !force_update_all) {
+      continue;
+    }
+
+    decode_result_to_string(&latest_result, result_str, sizeof(result_str));
+
+    snprintf(topic_buffer, sizeof(topic_buffer), "received TOP%d %s: %s", topic, decode_get_topic_name((heatpump_topic_t)topic), result_str);
+    log_message(topic_buffer);
+
+    snprintf(topic_buffer, sizeof(topic_buffer), "%s/%s/%s", heishamonSettings.mqtt_topic_base, mqtt_topic_values, decode_get_topic_name((heatpump_topic_t)topic));
+    const bool publish_result = mqtt_client.publish(topic_buffer, result_str, MQTT_RETAIN_VALUES);
+    if (publish_result) {
+      decode_topic_clear_filter((heatpump_topic_t)topic);
+    }
+  }
+
+  static int max_filter_depth = 0;
+  max_filter_depth = _max(max_filter_depth, decode_get_max_filter_depth());
+
+  snprintf(topic_buffer, sizeof(topic_buffer), "%s/%s/%s", heishamonSettings.mqtt_topic_base, mqtt_topic_values, "max_filter_depth");
+  snprintf(result_str, sizeof(result_str), "%i", max_filter_depth);
+
+  mqtt_client.publish(topic_buffer, result_str, MQTT_RETAIN_VALUES);
+
+  if (force_update_all) {
+    lastalldatatime = millis();
+  }
+
+  if (mqtt_connected == false) {
+    decode_topic_clear_filters();
+  }
+
+  memcpy(last_transmitted_buffer, serial_decoder_buffer, sizeof(last_transmitted_buffer));
+  has_unsent_topics = false;
+}
+
+byte calcChecksum(byte *command, int length)
+{
   byte chk = 0;
-  for ( int i = 0; i < length; i++)  {
+  for (int i = 0; i < length; i++) {
     chk += command[i];
   }
   chk = (chk ^ 0xFF) + 01;
   return chk;
 }
 
-bool isValidReceiveChecksum() {
-  byte chk = 0;
-  for ( int i = 0; i < data_length; i++)  {
-    chk += data[i];
-  }
-  return (chk == 0); //all received bytes + checksum should result in 0
-}
-
-bool readSerial()
+void readSerial()
 {
   int len = 0;
-  while ((Serial.available()) && ((data_length + len) < MAXDATASIZE)) {
-    data[data_length + len] = Serial.read(); //read available data and place it after the last received data
+  while ((Serial.available()) && ((serial_read_buffer_length + len) < DECODE_MAX_BUFFER_SIZE)) {
+    serial_read_buffer[serial_read_buffer_length + len] = Serial.read(); // read available data and place it after the last received data
     len++;
-    if (data[0] != 113) { //wrong header received!
-      log_message(_F("Received bad header. Ignoring this data!"));
-      if (heishamonSettings.logHexdump) logHex(data, len);
+
+    const decoder_buffer_validation_result_t buffer_status = decode_validate_buffer((uint8_t *)serial_read_buffer, serial_read_buffer_length + len);
+
+    // The handling of the bad header needs to happen here otherwise we can't get data with a good header.
+    // It's not clear to me why but I think it's because we need to empty the serial buffer fast.
+    // TODO: read all available data from the serial buffer and create a function in the decoder
+    // module to seek valid data/header in a buffer with a bad header.
+    if (buffer_status == DECODER_BUFFER_VALIDATION_INVALID_HEADER) {
       badheaderread++;
-      data_length = 0;
-      return false; //return so this while loop does not loop forever if there happens to be a continous invalid data stream
+      serial_read_buffer_length = 0;
+      len = 0;
+    }
+    else if (buffer_status != DECODER_BUFFER_VALIDATION_INCOMPLETE) {
+      break;
     }
   }
 
-  if ((len > 0) && (data_length == 0 )) totalreads++; //this is the start of a new read
-  data_length += len;
-
-  if (data_length > 1) { //should have received length part of header now
-
-    if ((data_length > (data[1] + 3)) || (data_length >= MAXDATASIZE) ) {
-      log_message(_F("Received more data than header suggests! Ignoring this as this is bad data."));
-      if (heishamonSettings.logHexdump) logHex(data, data_length);
-      data_length = 0;
-      toolongread++;
-      return false;
-    }
-
-    if (data_length == (data[1] + 3)) { //we received all data (data[1] is header length field)
-      sprintf_P(log_msg, PSTR("Received %d bytes data"), data_length); log_message(log_msg);
-      sending = false; //we received an answer after our last command so from now on we can start a new send request again
-      if (heishamonSettings.logHexdump) logHex(data, data_length);
-      if (! isValidReceiveChecksum() ) {
-        log_message(_F("Checksum received false!"));
-        data_length = 0; //for next attempt
-        badcrcread++;
-        return false;
-      }
-      log_message(_F("Checksum and header received ok!"));
-      goodreads++;
-
-      if (data_length == DATASIZE)  {  //receive a full data block
-        if  (data[3] == 0x10) { //decode the normal data block
-          decode_heatpump_data(data, actData, mqtt_client, log_message, heishamonSettings.mqtt_topic_base, heishamonSettings.updateAllTime);
-          memcpy(actData, data, DATASIZE);
-          {
-            char mqtt_topic[256];
-            sprintf(mqtt_topic, "%s/raw/data", heishamonSettings.mqtt_topic_base);
-            mqtt_client.publish(mqtt_topic, (const uint8_t *)actData, DATASIZE, false); //do not retain this raw data
-          }
-          data_length = 0;
-          return true;
-        } else if (data[3] == 0x21) { //decode the new model extra data block
-          extraDataBlockAvailable = true; //set the flag to true so we know we can request this data always
-          decode_heatpump_data_extra(data, actDataExtra, mqtt_client, log_message, heishamonSettings.mqtt_topic_base, heishamonSettings.updateAllTime);
-          memcpy(actDataExtra, data, DATASIZE);
-          {
-            char mqtt_topic[256];
-            sprintf(mqtt_topic, "%s/raw/dataextra", heishamonSettings.mqtt_topic_base);
-            mqtt_client.publish(mqtt_topic, (const uint8_t *)actDataExtra, DATASIZE, false); //do not retain this raw data
-          }
-          data_length = 0;
-          return true;        
-        } else {
-          log_message(_F("Received an unknown full size datagram. Can't decode this yet."));
-          data_length = 0;
-          return false;       
-        }
-      }
-      else if (data_length == OPTDATASIZE ) { //optional pcb acknowledge answer
-        log_message(_F("Received optional PCB ack answer. Decoding this in OPT topics."));
-        decode_optional_heatpump_data(data, actOptData, mqtt_client, log_message, heishamonSettings.mqtt_topic_base, heishamonSettings.updateAllTime);
-        memcpy(actOptData, data, OPTDATASIZE);
-        data_length = 0;
-        return true;
-      }
-      else {
-        log_message(_F("Received a shorter datagram. Can't decode this yet."));
-        data_length = 0;
-        return false;
-      }
-    }
-  }
-  return false;
+  if ((len > 0) && (serial_read_buffer_length == 0))
+    totalreads++; // this is the start of a new read
+  serial_read_buffer_length += len;
 }
 
-void popCommandBuffer() {
+void decode_panasonic_data()
+{
+  char mqtt_topic[256];
+  const decoder_buffer_validation_result_t buffer_status = decode_validate_buffer((uint8_t *)serial_read_buffer, serial_read_buffer_length);
+
+  if (buffer_status == DECODER_BUFFER_VALIDATION_INCOMPLETE) {
+    return;
+  }
+
+  sprintf_P(log_msg, PSTR("Received %d bytes data"), serial_read_buffer_length);
+  log_message(log_msg);
+
+  switch (buffer_status) {
+  case DECODER_BUFFER_VALIDATION_INVALID_HEADER:
+    log_message(F("Received bad header. Ignoring this data!"));
+    badheaderread++;
+    break;
+
+  case DECODER_BUFFER_VALIDATION_INVALID_LENGTH:
+    log_message(F("Received more data than header suggests! Ignoring this as this is bad data."));
+    toolongread++;
+    break;
+
+  case DECODER_BUFFER_VALIDATION_INVALID_CRC:
+    log_message(F("Checksum received false!"));
+    badcrcread++;
+    break;
+
+  case DECODER_BUFFER_VALIDATION_REGULAR_DATAGRAM_OK:
+    goodreads++;
+    has_unsent_topics = true;
+
+    // decode the normal data
+    decode_heatpump_data((uint8_t *)serial_read_buffer);
+    memcpy(serial_decoder_buffer, serial_read_buffer, DECODE_REGULAR_DATAGRAM_SIZE);
+
+    log_message(F("Checksum and header received ok!"));
+
+    sprintf(mqtt_topic, "%s/raw/data", heishamonSettings.mqtt_topic_base);
+    mqtt_client.publish(mqtt_topic, (const uint8_t *)serial_decoder_buffer, DECODE_REGULAR_DATAGRAM_SIZE, false); // do not retain this raw data
+
+    for (size_t topic_idx = 0; topic_idx < HEATPUMP_TOPIC_Last; topic_idx++) {
+      rules_new_event(decode_get_topic_name((heatpump_topic_t)topic_idx));
+    }
+    break;
+
+  case DECODER_BUFFER_VALIDATION_OPT_DATAGRAM_OK:
+    goodreads++;
+
+    // response to heatpump should contain the data from heatpump on byte 4 and 5
+    optionalPCBQuery[4] = serial_decoder_opt_buffer[4];
+    optionalPCBQuery[5] = serial_decoder_opt_buffer[5];
+
+    log_message(F("Received optional PCB ack answer. Decoding this in OPT topics."));
+    memcpy(serial_decoder_opt_buffer, serial_read_buffer, DECODE_OPT_DATAGRAM_SIZE);
+    decode_heatpump_opt_data((uint8_t *)serial_decoder_opt_buffer);
+
+    for (size_t opt_topic_idx = 0; opt_topic_idx < HEATPUMP_TOPIC_OPT_Last; opt_topic_idx++) {
+      rules_new_event(decode_get_opt_topic_name((heatpump_opt_topic_t)opt_topic_idx));
+    }
+    break;
+
+  default:
+    log_message(F("Received a shorter datagram. Can't decode this yet."));
+    break;
+  }
+
+  if (heishamonSettings.logHexdump)
+    logHex(serial_read_buffer, serial_read_buffer_length);
+
+  serial_read_buffer_length = 0;
+  sending = false;
+}
+
+void popCommandBuffer()
+{
   // to make sure we can pop a command from the buffer
   if ((!sending) && cmdnrel > 0) {
     send_command(cmdbuffer[cmdstart].data, cmdbuffer[cmdstart].length);
@@ -411,9 +511,10 @@ void popCommandBuffer() {
   }
 }
 
-void pushCommandBuffer(byte* command, int length) {
+void pushCommandBuffer(byte *command, int length)
+{
   if (cmdnrel + 1 > MAXCOMMANDSINBUFFER) {
-    log_message(_F("Too much commands already in buffer. Ignoring this commands.\n"));
+    log_message(F("Too much commands already in buffer. Ignoring this commands.\n"));
     return;
   }
   cmdbuffer[cmdend].length = length;
@@ -422,86 +523,94 @@ void pushCommandBuffer(byte* command, int length) {
   cmdnrel++;
 }
 
-bool send_command(byte* command, int length) {
-  if ( heishamonSettings.listenonly ) {
-    log_message(_F("Not sending this command. Heishamon in listen only mode!"));
+bool send_command(byte *command, int length)
+{
+  if (heishamonSettings.listenonly) {
+    log_message(F("Not sending this command. Heishamon in listen only mode!"));
     return false;
   }
-  if ( sending ) {
-    log_message(_F("Already sending data. Buffering this send request"));
+  if (sending) {
+    log_message(F("Already sending data. Buffering this send request"));
     pushCommandBuffer(command, length);
     return false;
   }
-  sending = true; //simple semaphore to only allow one send command at a time, semaphore ends when answered data is received
+  sending = true; // simple semaphore to only allow one send command at a time, semaphore ends when answered data is received
 
   byte chk = calcChecksum(command, length);
-  int bytesSent = Serial.write(command, length); //first send command
-  bytesSent += Serial.write(chk); //then calculcated checksum byte afterwards
+  int bytesSent = Serial.write(command, length); // first send command
+  bytesSent += Serial.write(chk);                // then calculcated checksum byte afterwards
   sprintf_P(log_msg, PSTR("sent bytes: %d including checksum value: %d "), bytesSent, int(chk));
   log_message(log_msg);
 
-  if (heishamonSettings.logHexdump) logHex((char*)command, length);
-  sendCommandReadTime = millis(); //set sendCommandReadTime when to timeout the answer of this command
+  if (heishamonSettings.logHexdump)
+    logHex((char *)command, length);
+  sendCommandReadTime = millis(); // set sendCommandReadTime when to timeout the answer of this command
   return true;
 }
 
 // Callback function that is called when a message has been pushed to one of your topics.
-void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+void mqtt_callback(char *topic, byte *payload, unsigned int length)
+{
   if (mqttcallbackinprogress) {
-    log_message(_F("Already processing another mqtt callback. Ignoring this one"));
+    log_message(F("Already processing another mqtt callback. Ignoring this one"));
   }
   else {
-    mqttcallbackinprogress = true; //simple semaphore to make sure we don't have two callbacks at the same time
+    mqttcallbackinprogress = true; // simple semaphore to make sure we don't have two callbacks at the same time
     char msg[length + 1];
     for (unsigned int i = 0; i < length; i++) {
       msg[i] = (char)payload[i];
     }
     msg[length] = '\0';
-    char* topic_command = topic + strlen(heishamonSettings.mqtt_topic_base) + 1; //strip base plus seperator from topic
-    if (strcmp(topic_command, mqtt_send_raw_value_topic) == 0)
-    { // send a raw hex string
+    char *topic_command = topic + strlen(heishamonSettings.mqtt_topic_base) + 1; // strip base plus seperator from topic
+    if (strcmp(topic_command, mqtt_send_raw_value_topic) == 0) { // send a raw hex string
       byte *rawcommand;
-      rawcommand = (byte *) malloc(length);
+      rawcommand = (byte *)malloc(length);
       memcpy(rawcommand, msg, length);
 
       sprintf_P(log_msg, PSTR("sending raw value"));
       log_message(log_msg);
       send_command(rawcommand, length);
       free(rawcommand);
-    } else if (strncmp(topic_command, mqtt_topic_s0, strlen(mqtt_topic_s0)) == 0)  // this is a s0 topic, check for watthour topic and restore it
+    }
+    else if (strncmp(topic_command, mqtt_topic_s0, 2) == 0) // this is a s0 topic, check for watthour topic and restore it
     {
-      char* topic_s0_watthour_port = topic_command + strlen(mqtt_topic_s0) + 15; //strip the first 17 "s0/WatthourTotal/" from the topic to get the s0 port
+      char *topic_s0_watthour_port = topic_command + 17; // strip the first 17 "s0/WatthourTotal/" from the topic to get the s0 port
       int s0Port = String(topic_s0_watthour_port).toInt();
       float watthour = String(msg).toFloat();
       restore_s0_Watthour(s0Port, watthour);
-      //unsubscribe after restoring the watthour values
+      // unsubscribe after restoring the watthour values
       char mqtt_topic[256];
       sprintf(mqtt_topic, "%s", topic);
       if (mqtt_client.unsubscribe(mqtt_topic)) {
-        log_message(_F("Unsubscribed from S0 watthour restore topic"));
+        log_message(F("Unsubscribed from S0 watthour restore topic"));
       }
-    } else if (strncmp(topic_command, mqtt_topic_commands, strlen(mqtt_topic_commands)) == 0)  // check for commands to heishamon
+    }
+    else if (strncmp(topic_command, mqtt_topic_commands, 8) == 0) // check for optional pcb commands
     {
-      char* topic_sendcommand = topic_command + strlen(mqtt_topic_commands) + 1; //strip the first 9 "commands/" from the topic to get what we need
+      char *topic_sendcommand = topic_command + 9; // strip the first 9 "commands/" from the topic to get what we need
       send_heatpump_command(topic_sendcommand, msg, send_command, log_message, heishamonSettings.optionalPCB);
     }
-    //use this to receive valid heishamon raw data from other heishamon to debug this OT code
-#ifdef OTDEBUG
-    else if (strcmp((char*)"panasonic_heat_pump/data", topic) == 0) {  // check for raw heatpump input
-      sprintf_P(log_msg, PSTR("Received raw heatpump data from MQTT"));
-      log_message(log_msg);
-      decode_heatpump_data(msg, actData, mqtt_client, log_message, heishamonSettings.mqtt_topic_base, heishamonSettings.updateAllTime);
-      memcpy(actData, msg, DATASIZE);
-#endif
-    } else if (strncmp(topic_command, mqtt_topic_opentherm, strlen(mqtt_topic_opentherm)) == 0)  {
-      char* topic_otcommand = topic_command + strlen(mqtt_topic_opentherm) + 1; //strip the opentherm subtopic from the topic
-      mqttOTCallback(topic_otcommand, msg);
+    else if (stricmp((char const *)topic, "panasonic_heat_pump/opentherm/Temperature") == 0) {
+      char cpy[length + 1];
+      memset(&cpy, 0, length + 1);
+      strncpy(cpy, (char *)payload, length);
+      openTherm[0] = cpy;
+      rules_event_cb("temperature");
+    }
+    else if (stricmp((char const *)topic, "panasonic_heat_pump/opentherm/Setpoint") == 0) {
+      char cpy[length + 1];
+      memset(&cpy, 0, length + 1);
+      strncpy(cpy, (char *)payload, length);
+      openTherm[1] = cpy;
+
+      rules_event_cb("setpoint");
     }
     mqttcallbackinprogress = false;
   }
 }
 
-void setupOTA() {
+void setupOTA()
+{
   // Port defaults to 8266
   ArduinoOTA.setPort(8266);
 
@@ -511,410 +620,531 @@ void setupOTA() {
   // Set authentication
   ArduinoOTA.setPassword(heishamonSettings.ota_password);
 
-  ArduinoOTA.onStart([]() {
-  });
-  ArduinoOTA.onEnd([]() {
-  });
+  ArduinoOTA.onStart([]() {});
+  ArduinoOTA.onEnd([]() {});
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
 
-  });
+    });
   ArduinoOTA.onError([](ota_error_t error) {
 
-  });
+    });
   ArduinoOTA.begin();
 }
 
-int8_t webserver_cb(struct webserver_t *client, void *dat) {
+int8_t webserver_cb(struct webserver_t *client, void *dat)
+{
   switch (client->step) {
-    case WEBSERVER_CLIENT_REQUEST_METHOD: {
-        if (strcmp_P((char *)dat, PSTR("POST")) == 0) {
-          client->route = 110;
+  case WEBSERVER_CLIENT_REQUEST_METHOD:
+  {
+    if (strcmp_P((char *)dat, PSTR("POST")) == 0) {
+      client->route = 110;
+    }
+    return 0;
+  }
+  break;
+  case WEBSERVER_CLIENT_REQUEST_URI:
+  {
+    if (strcmp_P((char *)dat, PSTR("/")) == 0) {
+      client->route = 1;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/tablerefresh")) == 0) {
+      client->route = 10;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/json")) == 0) {
+      client->route = 20;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/reboot")) == 0) {
+      client->route = 30;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/debug")) == 0) {
+      client->route = 40;
+      log_message(F("Debug URL requested"));
+    }
+    else if (strcmp_P((char *)dat, PSTR("/wifiscan")) == 0) {
+      client->route = 50;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/togglelog")) == 0) {
+      client->route = 1;
+      log_message(F("Toggled mqtt log flag"));
+      heishamonSettings.logMqtt ^= true;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/togglehexdump")) == 0) {
+      client->route = 1;
+      log_message(F("Toggled hexdump log flag"));
+      heishamonSettings.logHexdump ^= true;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/hotspot-detect.html")) == 0 ||
+      strcmp_P((char *)dat, PSTR("/fwlink")) == 0 ||
+      strcmp_P((char *)dat, PSTR("/generate_204")) == 0 ||
+      strcmp_P((char *)dat, PSTR("/gen_204")) == 0 ||
+      strcmp_P((char *)dat, PSTR("/popup")) == 0) {
+      client->route = 80;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/factoryreset")) == 0) {
+      client->route = 90;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/command")) == 0) {
+      if ((client->userdata = malloc(1)) == NULL) {
+        Serial1.printf(PSTR("Out of memory %s:#%d\n"), __FUNCTION__, __LINE__);
+        ESP.restart();
+        exit(-1);
+      }
+      ((char *)client->userdata)[0] = 0;
+      client->route = 100;
+    }
+    else if (client->route == 110) {
+      // Only accept settings POST requests
+      if (strcmp_P((char *)dat, PSTR("/savesettings")) == 0) {
+        client->route = 110;
+      }
+      else if (strcmp_P((char *)dat, PSTR("/saverules")) == 0) {
+        client->route = 170;
+
+        if (LittleFS.begin()) {
+          LittleFS.remove("/rules.new");
+          client->userdata = new File(LittleFS.open("/rules.new", "a+"));
         }
-        return 0;
-      } break;
-    case WEBSERVER_CLIENT_REQUEST_URI: {
-        if (strcmp_P((char *)dat, PSTR("/")) == 0) {
-          client->route = 1;
-        } else if (strcmp_P((char *)dat, PSTR("/tablerefresh")) == 0) {
-          client->route = 10;
-        } else if (strcmp_P((char *)dat, PSTR("/json")) == 0) {
-          client->route = 20;
-        } else if (strcmp_P((char *)dat, PSTR("/reboot")) == 0) {
-          client->route = 30;
-        } else if (strcmp_P((char *)dat, PSTR("/debug")) == 0) {
-          client->route = 40;
-          log_message(_F("Debug URL requested"));
-        } else if (strcmp_P((char *)dat, PSTR("/wifiscan")) == 0) {
-          client->route = 50;
-        } else if (strcmp_P((char *)dat, PSTR("/togglelog")) == 0) {
-          client->route = 1;
-          log_message(_F("Toggled mqtt log flag"));
-          heishamonSettings.logMqtt ^= true;
-        } else if (strcmp_P((char *)dat, PSTR("/togglehexdump")) == 0) {
-          client->route = 1;
-          log_message(_F("Toggled hexdump log flag"));
-          heishamonSettings.logHexdump ^= true;
-        } else if (strcmp_P((char *)dat, PSTR("/hotspot-detect.html")) == 0 ||
-                   strcmp_P((char *)dat, PSTR("/fwlink")) == 0 ||
-                   strcmp_P((char *)dat, PSTR("/generate_204")) == 0 ||
-                   strcmp_P((char *)dat, PSTR("/gen_204")) == 0 ||
-                   strcmp_P((char *)dat, PSTR("/popup")) == 0) {
-          client->route = 80;
-        } else if (strcmp_P((char *)dat, PSTR("/factoryreset")) == 0) {
-          client->route = 90;
-        } else if (strcmp_P((char *)dat, PSTR("/command")) == 0) {
-          if ((client->userdata = malloc(1)) == NULL) {
+      }
+      else if (strcmp_P((char *)dat, PSTR("/firmware")) == 0) {
+        if (!Update.isRunning()) {
+          Update.runAsync(true);
+          if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) {
+            Update.printError(Serial1);
+            return -1;
+          }
+          else {
+            client->route = 150;
+          }
+        }
+        else {
+          Serial1.println(PSTR("New firmware update client, while previous isn't finished yet! Assume broken connection, abort!"));
+          Update.end();
+          return -1;
+        }
+      }
+      else {
+        return -1;
+      }
+    }
+    else if (strcmp_P((char *)dat, PSTR("/settings")) == 0) {
+      client->route = 120;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/getsettings")) == 0) {
+      client->route = 130;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/firmware")) == 0) {
+      client->route = 140;
+    }
+    else if (strcmp_P((char *)dat, PSTR("/rules")) == 0) {
+      client->route = 160;
+    }
+    else {
+      client->route = 0;
+    }
+
+    return 0;
+  }
+  break;
+  case WEBSERVER_CLIENT_ARGS:
+  {
+    struct arguments_t *args = (struct arguments_t *)dat;
+    switch (client->route) {
+    case 10:
+    {
+      if (strcmp_P((char *)args->name, PSTR("1wire")) == 0) {
+        client->route = 11;
+      }
+      else if (strcmp_P((char *)args->name, PSTR("s0")) == 0) {
+        client->route = 12;
+      }
+    }
+    break;
+    case 100:
+    {
+      unsigned char cmd[256] = { 0 };
+      char cpy[args->len + 1];
+      char log_msg[256] = { 0 };
+      unsigned int len = 0;
+
+      memset(&cpy, 0, args->len + 1);
+      snprintf((char *)&cpy, args->len + 1, "%.*s", args->len, args->value);
+
+      for (uint8_t x = 0; x < sizeof(commands) / sizeof(commands[0]); x++) {
+        cmdStruct tmp;
+        memcpy_P(&tmp, &commands[x], sizeof(tmp));
+        if (strcmp((char *)args->name, tmp.name) == 0) {
+          len = tmp.func(cpy, cmd, log_msg);
+          if ((client->userdata = realloc(client->userdata, strlen((char *)client->userdata) + strlen(log_msg) + 2)) == NULL) {
             Serial1.printf(PSTR("Out of memory %s:#%d\n"), __FUNCTION__, __LINE__);
             ESP.restart();
             exit(-1);
           }
-          ((char *)client->userdata)[0] = 0;
-          client->route = 100;
-        } else if (client->route == 110) {
-          // Only accept settings POST requests
-          if (strcmp_P((char *)dat, PSTR("/savesettings")) == 0) {
-            client->route = 110;
-          } else if (strcmp_P((char *)dat, PSTR("/saverules")) == 0) {
-            client->route = 170;
+          strcat((char *)client->userdata, log_msg);
+          strcat((char *)client->userdata, "\n");
+          log_message(log_msg);
+          send_command(cmd, len);
+        }
+      }
 
-            if (LittleFS.begin()) {
-              LittleFS.remove("/rules.new");
-              client->userdata = new File(LittleFS.open("/rules.new", "a+"));
+      memset(&cmd, 256, 0);
+      memset(&log_msg, 256, 0);
+
+      if (heishamonSettings.optionalPCB) {
+        // optional commands
+        for (uint8_t x = 0; x < sizeof(optionalCommands) / sizeof(optionalCommands[0]); x++) {
+          optCmdStruct tmp;
+          memcpy_P(&tmp, &optionalCommands[x], sizeof(tmp));
+          if (strcmp((char *)args->name, tmp.name) == 0) {
+            len = tmp.func(cpy, log_msg);
+            if ((client->userdata = realloc(client->userdata, strlen((char *)client->userdata) + strlen(log_msg) + 2)) == NULL) {
+              Serial1.printf(PSTR("Out of memory %s:#%d\n"), __FUNCTION__, __LINE__);
+              ESP.restart();
+              exit(-1);
             }
-          } else if (strcmp_P((char *)dat, PSTR("/firmware")) == 0) {
-            if (!Update.isRunning()) {
-              Update.runAsync(true);
-              if (!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)) {
-                Update.printError(Serial1);
-                return -1;
-              } else {
-                client->route = 150;
-              }
-            } else {
-              Serial1.println(PSTR("New firmware update client, while previous isn't finished yet! Assume broken connection, abort!"));
-              Update.end();
-              return -1;
-            }
-          } else {
-            return -1;
+            strcat((char *)client->userdata, log_msg);
+            strcat((char *)client->userdata, "\n");
+            log_message(log_msg);
           }
-        } else if (strcmp_P((char *)dat, PSTR("/settings")) == 0) {
-          client->route = 120;
-        } else if (strcmp_P((char *)dat, PSTR("/getsettings")) == 0) {
-          client->route = 130;
-        } else if (strcmp_P((char *)dat, PSTR("/firmware")) == 0) {
-          client->route = 140;
-        } else if (strcmp_P((char *)dat, PSTR("/rules")) == 0) {
-          client->route = 160;
-        } else {
-          client->route = 0;
         }
+      }
 
-        return 0;
-      } break;
-    case WEBSERVER_CLIENT_ARGS: {
-        struct arguments_t *args = (struct arguments_t *)dat;
-        switch (client->route) {
-          case 10: {
-              if (strcmp_P((char *)args->name, PSTR("1wire")) == 0) {
-                client->route = 11;
-              } else if (strcmp_P((char *)args->name, PSTR("s0")) == 0) {
-                client->route = 12;
-              } else if (strcmp_P((char *)args->name, PSTR("opentherm")) == 0) {
-                client->route = 13;
-              }
-            } break;
-          case 100: {
-              unsigned char cmd[256] = { 0 };
-              char cpy[args->len + 1];
-              char log_msg[256] = { 0 };
-              unsigned int len = 0;
-
-              memset(&cpy, 0, args->len + 1);
-              snprintf((char *)&cpy, args->len + 1, "%.*s", args->len, args->value);
-
-              for (uint8_t x = 0; x < sizeof(commands) / sizeof(commands[0]); x++) {
-                cmdStruct tmp;
-                memcpy_P(&tmp, &commands[x], sizeof(tmp));
-                if (strcmp((char *)args->name, tmp.name) == 0) {
-                  len = tmp.func(cpy, cmd, log_msg);
-                  if ((client->userdata = realloc(client->userdata, strlen((char *)client->userdata) + strlen(log_msg) + 2)) == NULL) {
-                    Serial1.printf(PSTR("Out of memory %s:#%d\n"), __FUNCTION__, __LINE__);
-                    ESP.restart();
-                    exit(-1);
-                  }
-                  strcat((char *)client->userdata, log_msg);
-                  strcat((char *)client->userdata, "\n");
-                  log_message(log_msg);
-                  send_command(cmd, len);
-                }
-              }
-
-              memset(&cmd, 256, 0);
-              memset(&log_msg, 256, 0);
-
-              if (heishamonSettings.optionalPCB) {
-                //optional commands
-                for (uint8_t x = 0; x < sizeof(optionalCommands) / sizeof(optionalCommands[0]); x++) {
-                  optCmdStruct tmp;
-                  memcpy_P(&tmp, &optionalCommands[x], sizeof(tmp));
-                  if (strcmp((char *)args->name, tmp.name) == 0) {
-                    len = tmp.func(cpy, log_msg);
-                    if ((client->userdata = realloc(client->userdata, strlen((char *)client->userdata) + strlen(log_msg) + 2)) == NULL) {
-                      Serial1.printf(PSTR("Out of memory %s:#%d\n"), __FUNCTION__, __LINE__);
-                      ESP.restart();
-                      exit(-1);
-                    }
-                    strcat((char *)client->userdata, log_msg);
-                    strcat((char *)client->userdata, "\n");
-                    log_message(log_msg);
-                  }
-                }
-              }
-            } break;
-          case 110: {
-              return cacheSettings(client, args);
-            } break;
-          case 150: {
-              if (Update.isRunning() && (!Update.hasError())) {
-                if ((strcmp((char *)args->name, "md5") == 0) && (args->len > 0)) {
-                  char md5[args->len + 1];
-                  memset(&md5, 0, args->len + 1);
-                  snprintf((char *)&md5, args->len + 1, "%.*s", args->len, args->value);
-                  sprintf_P(log_msg, PSTR("Firmware MD5 expected: %s"), md5);
-                  log_message(log_msg);
-                  if (!Update.setMD5(md5)) {
-                    log_message(_F("Failed to set expected update file MD5!"));
-                    Update.end(false);
-                  }
-                } else if (strcmp((char *)args->name, "firmware") == 0) {
-                  if (Update.write((uint8_t *)args->value, args->len) != args->len) {
-                    Update.printError(Serial1);
-                    Update.end(false);
-                  } else {
-                    if (uploadpercentage != (unsigned int)(((float)client->readlen / (float)client->totallen) * 20)) {
-                      uploadpercentage = (unsigned int)(((float)client->readlen / (float)client->totallen) * 20);
-                      sprintf_P(log_msg, PSTR("Uploading new firmware: %d%%"), uploadpercentage * 5);
-                      log_message(log_msg);
-                    }
-                  }
-                }
-              } else {
-                log_message((char*)"New firmware POST data but update not running anymore!");
-              }
-            } break;
-          case 170: {
-              File *f = (File *)client->userdata;
-              if (!f || !*f) {
-                client->route = 160;
-              } else {
-                f->write(args->value, args->len);
-              }
-            } break;
+      if (stricmp((char const *)args->name, "temperature") == 0) {
+        char cpy[args->len + 1];
+        strcpy(cpy, (char *)args->value);
+        openTherm[0] = cpy;
+        rules_event_cb("temperature");
+      }
+      else if (stricmp((char const *)args->name, "setpoint") == 0) {
+        char cpy[args->len + 1];
+        strcpy(cpy, (char *)args->value);
+        openTherm[1] = cpy;
+        rules_event_cb("setpoint");
+      }
+    }
+    break;
+    case 110:
+    {
+      return cacheSettings(client, args);
+    }
+    break;
+    case 150:
+    {
+      if (Update.isRunning() && (!Update.hasError())) {
+        if ((strcmp((char *)args->name, "md5") == 0) && (args->len > 0)) {
+          char md5[args->len + 1];
+          memset(&md5, 0, args->len + 1);
+          snprintf((char *)&md5, args->len + 1, "%.*s", args->len, args->value);
+          sprintf_P(log_msg, PSTR("Firmware MD5 expected: %s"), md5);
+          log_message(log_msg);
+          if (!Update.setMD5(md5)) {
+            log_message(F("Failed to set expected update file MD5!"));
+            Update.end(false);
+          }
         }
-      } break;
-    case WEBSERVER_CLIENT_HEADER: {
-        struct arguments_t *args = (struct arguments_t *)dat;
-        return 0;
-      } break;
-    case WEBSERVER_CLIENT_WRITE: {
-        switch (client->route) {
-          case 0: {
-              if (client->content == 0) {
-                webserver_send(client, 404, (char *)"text/plain", 13);
-                webserver_send_content_P(client, PSTR("404 Not found"), 13);
-              }
-              return 0;
-            } break;
-          case 1: {
-              return handleRoot(client, readpercentage, mqttReconnects, &heishamonSettings);
-            } break;
-          case 10:
-          case 11:
-          case 12:
-          case 13: {
-              return handleTableRefresh(client, actData, actDataExtra, extraDataBlockAvailable);
-            } break;
-          case 20: {
-              return handleJsonOutput(client, actData, actDataExtra, &heishamonSettings, extraDataBlockAvailable);
-            } break;
-          case 30: {
-              return handleReboot(client);
-            } break;
-          case 40: {
-              return handleDebug(client, (char *)data, 203);
-            } break;
-          case 50: {
-              return handleWifiScan(client);
-            } break;
-          case 80: {
-              return handleSettings(client);
-            } break;
-          case 90: {
-              return handleFactoryReset(client);
-            } break;
-          case 100: {
-              if (client->content == 0) {
-                webserver_send(client, 200, (char *)"text/plain", 0);
-                char *RESTmsg = (char *)client->userdata;
-                webserver_send_content(client, (char *)RESTmsg, strlen(RESTmsg));
-                free(RESTmsg);
-                client->userdata = NULL;
-              }
-              return 0;
-            } break;
-          case 110: {
-              int ret = saveSettings(client, &heishamonSettings);
-              if ((!heishamonSettings.opentherm) && (heishamonSettings.listenonly)) {
-                //make sure we disable TX to heatpump-RX using the mosfet so this line is floating and will not disturb cz-taw1
-                //does not work for opentherm version currently
-                digitalWrite(5, LOW);
-              } else {
-                digitalWrite(5, HIGH);
-              }
-              switch (client->route) {
-                case 111: {
-                    return settingsNewPassword(client, &heishamonSettings);
-                  } break;
-                case 112: {
-                    return settingsReconnectWifi(client, &heishamonSettings);
-                  } break;
-                case 113: {
-                    webserver_send(client, 301, (char *)"text/plain", 0);
-                  } break;
-              }
-              return 0;
-            } break;
-          case 111: {
-              return settingsNewPassword(client, &heishamonSettings);
-            } break;
-          case 112: {
-              return settingsReconnectWifi(client, &heishamonSettings);
-            } break;
-          case 120: {
-              return handleSettings(client);
-            } break;
-          case 130: {
-              return getSettings(client, &heishamonSettings);
-            } break;
-          case 140: {
-              return showFirmware(client);
-            } break;
-          case 150: {
-              log_message((char*)"In /firmware client write part");
-              if (Update.isRunning()) {
-                if (Update.end(true)) {
-                  log_message((char*)"Firmware update success");
-                  timerqueue_insert(2, 0, -2); // Start reboot sequence
-                  return showFirmwareSuccess(client);
-                } else {
-                  Update.printError(Serial1);
-                  return showFirmwareFail(client);
-                }
-              }
-              return 0;
-            } break;
-          case 160: {
-              return showRules(client);
-            } break;
-          case 170: {
-              File *f = (File *)client->userdata;
-              if (f) {
-                if (*f) {
-                  f->close();
-                }
-                delete f;
-              }
-              client->userdata = NULL;
-              timerqueue_insert(0, 1, -4);
-              webserver_send(client, 301, (char *)"text/plain", 0);
-            } break;
-          default: {
-              webserver_send(client, 301, (char *)"text/plain", 0);
-            } break;
+        else if (strcmp((char *)args->name, "firmware") == 0) {
+          if (Update.write((uint8_t *)args->value, args->len) != args->len) {
+            Update.printError(Serial1);
+            Update.end(false);
+          }
+          else {
+            if (uploadpercentage != (unsigned int)(((float)client->readlen / (float)client->totallen) * 20)) {
+              uploadpercentage = (unsigned int)(((float)client->readlen / (float)client->totallen) * 20);
+              sprintf_P(log_msg, PSTR("Uploading new firmware: %d%%"), uploadpercentage * 5);
+              log_message(log_msg);
+            }
+          }
         }
-        return -1;
-      } break;
-    case WEBSERVER_CLIENT_CREATE_HEADER: {
-        struct header_t *header = (struct header_t *)dat;
-        switch (client->route) {
-          case 113: {
-              header->ptr += sprintf_P((char *)header->buffer, PSTR("Location: /settings"));
-              return -1;
-            } break;
-          case 60:
-          case 70: {
-              header->ptr += sprintf_P((char *)header->buffer, PSTR("Location: /"));
-              return -1;
-            } break;
-          case 170: {
-              header->ptr += sprintf_P((char *)header->buffer, PSTR("Location: /rules"));
-              return -1;
-            } break;
-          default: {
-              if (client->route != 0) {
-                header->ptr += sprintf_P((char *)header->buffer, PSTR("Access-Control-Allow-Origin: *"));
-              }
-            } break;
-        }
-        return 0;
-      } break;
-    case WEBSERVER_CLIENT_CLOSE: {
-        switch (client->route) {
-          case 100: {
-              if (client->userdata != NULL) {
-                free(client->userdata);
-              }
-            } break;
-          case 110: {
-              struct websettings_t *tmp = NULL;
-              while (client->userdata) {
-                tmp = (struct websettings_t *)client->userdata;
-                client->userdata = ((struct websettings_t *)(client->userdata))->next;
-                free(tmp);
-              }
-            } break;
-          case 160:
-          case 170: {
-              if (client->userdata != NULL) {
-                File *f = (File *)client->userdata;
-                if (f) {
-                  if (*f) {
-                    f->close();
-                  }
-                  delete f;
-                }
-              }
-            } break;
-        }
+      }
+      else {
+        log_message((char *)"New firmware POST data but update not running anymore!");
+      }
+    }
+    break;
+    case 170:
+    {
+      File *f = (File *)client->userdata;
+      if (!f || !*f) {
+        client->route = 160;
+      }
+      else {
+        f->write(args->value, args->len);
+      }
+    }
+    break;
+    }
+  }
+  break;
+  case WEBSERVER_CLIENT_HEADER:
+  {
+    struct arguments_t *args = (struct arguments_t *)dat;
+    return 0;
+  }
+  break;
+  case WEBSERVER_CLIENT_WRITE:
+  {
+    switch (client->route) {
+    case 0:
+    {
+      if (client->content == 0) {
+        webserver_send(client, 404, (char *)"text/plain", 13);
+        webserver_send_content_P(client, PSTR("404 Not found"), 13);
+      }
+      return 0;
+    }
+    break;
+    case 1:
+    {
+      return handleRoot(client, readpercentage, mqttReconnects, &heishamonSettings);
+    }
+    break;
+    case 10:
+    case 11:
+    case 12:
+    {
+      return handleTableRefresh(client, serial_decoder_buffer);
+    }
+    break;
+    case 20:
+    {
+      return handleJsonOutput(client, serial_decoder_buffer);
+    }
+    break;
+    case 30:
+    {
+      return handleReboot(client);
+    }
+    break;
+    case 40:
+    {
+      return handleDebug(client, (char *)serial_read_buffer, 203);
+    }
+    break;
+    case 50:
+    {
+      return handleWifiScan(client);
+    }
+    break;
+    case 80:
+    {
+      return handleSettings(client);
+    }
+    break;
+    case 90:
+    {
+      return handleFactoryReset(client);
+    }
+    break;
+    case 100:
+    {
+      if (client->content == 0) {
+        webserver_send(client, 200, (char *)"text/plain", 0);
+        char *RESTmsg = (char *)client->userdata;
+        webserver_send_content(client, (char *)RESTmsg, strlen(RESTmsg));
+        free(RESTmsg);
         client->userdata = NULL;
-      } break;
-    default: {
-        return 0;
-      } break;
+      }
+      return 0;
+    }
+    break;
+    case 110:
+    {
+      int ret = saveSettings(client, &heishamonSettings);
+      if (heishamonSettings.listenonly) {
+        // make sure we disable TX to heatpump-RX using the mosfet so this line is floating and will not disturb cz-taw1
+        digitalWrite(5, LOW);
+      }
+      else {
+        digitalWrite(5, HIGH);
+      }
+      switch (client->route) {
+      case 111:
+      {
+        return settingsNewPassword(client, &heishamonSettings);
+      }
+      break;
+      case 112:
+      {
+        return settingsReconnectWifi(client, &heishamonSettings);
+      }
+      break;
+      case 113:
+      {
+        webserver_send(client, 301, (char *)"text/plain", 0);
+      }
+      break;
+      }
+      return 0;
+    }
+    break;
+    case 111:
+    {
+      return settingsNewPassword(client, &heishamonSettings);
+    }
+    break;
+    case 112:
+    {
+      return settingsReconnectWifi(client, &heishamonSettings);
+    }
+    break;
+    case 120:
+    {
+      return handleSettings(client);
+    }
+    break;
+    case 130:
+    {
+      return getSettings(client, &heishamonSettings);
+    }
+    break;
+    case 140:
+    {
+      return showFirmware(client);
+    }
+    break;
+    case 150:
+    {
+      log_message((char *)"In /firmware client write part");
+      if (Update.isRunning()) {
+        if (Update.end(true)) {
+          log_message((char *)"Firmware update success");
+          timerqueue_insert(2, 0, -2); // Start reboot sequence
+          return showFirmwareSuccess(client);
+        }
+        else {
+          Update.printError(Serial1);
+          return showFirmwareFail(client);
+        }
+      }
+      return 0;
+    }
+    break;
+    case 160:
+    {
+      return showRules(client);
+    }
+    break;
+    case 170:
+    {
+      File *f = (File *)client->userdata;
+      if (f) {
+        if (*f) {
+          f->close();
+        }
+        delete f;
+      }
+      client->userdata = NULL;
+      timerqueue_insert(0, 1, -4);
+      webserver_send(client, 301, (char *)"text/plain", 0);
+    }
+    break;
+    default:
+    {
+      webserver_send(client, 301, (char *)"text/plain", 0);
+    }
+    break;
+    }
+    return -1;
+  }
+  break;
+  case WEBSERVER_CLIENT_CREATE_HEADER:
+  {
+    struct header_t *header = (struct header_t *)dat;
+    switch (client->route) {
+    case 113:
+    {
+      header->ptr += sprintf_P((char *)header->buffer, PSTR("Location: /settings"));
+      return -1;
+    }
+    break;
+    case 60:
+    case 70:
+    {
+      header->ptr += sprintf_P((char *)header->buffer, PSTR("Location: /"));
+      return -1;
+    }
+    break;
+    case 170:
+    {
+      header->ptr += sprintf_P((char *)header->buffer, PSTR("Location: /rules"));
+      return -1;
+    }
+    break;
+    default:
+    {
+      if (client->route != 0) {
+        header->ptr += sprintf_P((char *)header->buffer, PSTR("Access-Control-Allow-Origin: *"));
+      }
+    }
+    break;
+    }
+    return 0;
+  }
+  break;
+  case WEBSERVER_CLIENT_CLOSE:
+  {
+    switch (client->route) {
+    case 100:
+    {
+      if (client->userdata != NULL) {
+        free(client->userdata);
+      }
+    }
+    break;
+    case 110:
+    {
+      struct websettings_t *tmp = NULL;
+      while (client->userdata) {
+        tmp = (struct websettings_t *)client->userdata;
+        client->userdata = ((struct websettings_t *)(client->userdata))->next;
+        free(tmp);
+      }
+    }
+    break;
+    case 160:
+    case 170:
+    {
+      if (client->userdata != NULL) {
+        File *f = (File *)client->userdata;
+        if (f) {
+          if (*f) {
+            f->close();
+          }
+          delete f;
+        }
+      }
+    }
+    break;
+    }
+    client->userdata = NULL;
+  }
+  break;
+  default:
+  {
+    return 0;
+  }
+  break;
   }
 
   return 0;
 }
 
-void setupHttp() {
+void setupHttp()
+{
   webserver_start(80, &webserver_cb, 0);
 }
 
-void doubleResetDetect() {
+void doubleResetDetect()
+{
   if (drd.detect()) {
-    Serial.println("Double reset detected, clearing config."); //save to print on std serial because serial switch didn't happen yet
+    Serial.println("Double reset detected, clearing config."); // save to print on std serial because serial switch didn't happen yet
     LittleFS.begin();
     LittleFS.format();
-    //create first boot file
-    File startupFile = LittleFS.open("/heishamon", "w");
-    startupFile.close();    
     WiFi.persistent(true);
     WiFi.disconnect();
     WiFi.persistent(false);
     Serial.println("Config cleared. Please reset to configure this device...");
-    //initiate debug led indication for factory reset
-    pinMode(2, FUNCTION_0); //set it as gpio
+    // initiate debug led indication for factory reset
+    pinMode(2, FUNCTION_0); // set it as gpio
     pinMode(2, OUTPUT);
     while (true) {
       digitalWrite(2, HIGH);
@@ -922,132 +1152,153 @@ void doubleResetDetect() {
       digitalWrite(2, LOW);
       delay(100);
     }
-
   }
 }
 
-void setupSerial() {
-  //boot issue's first on normal serial
+void setupSerial()
+{
+  // boot issue's first on normal serial
   Serial.begin(115200);
   Serial.flush();
 }
 
-void setupSerial1() {
-  if (heishamonSettings.logSerial1) { //settings are not loaded yet, this is the startup default
-    //debug line on serial1 (D4, GPIO2)
+void setupSerial1()
+{
+  if (heishamonSettings.logSerial1) {
+    // debug line on serial1 (D4, GPIO2)
     Serial1.begin(115200);
-    Serial1.print(F("Starting debugging, version: "));
-    Serial1.println(heishamon_version);
+    Serial1.println(F("Starting debugging"));
   }
   else {
-    pinMode(2, FUNCTION_0); //set it as gpio
+    pinMode(2, FUNCTION_0); // set it as gpio
   }
 }
 
-void switchSerial() {
+void switchSerial()
+{
   Serial.println(F("Switching serial to connect to heatpump. Look for debug on serial1 (GPIO2) and mqtt log topic."));
-  //serial to cn-cnt
+  // serial to cn-cnt
   Serial.flush();
   Serial.end();
   Serial.begin(9600, SERIAL_8E1);
   Serial.flush();
-  //swap to gpio13 (D7) and gpio15 (D8)
+  // swap to gpio13 (D7) and gpio15 (D8)
   Serial.swap();
-  //turn on GPIO's on tx/rx for opentherm part
+  // turn on GPIO's on tx/rx for later use
   pinMode(1, FUNCTION_3);
   pinMode(3, FUNCTION_3);
 
-  setupGPIO(heishamonSettings.gpioSettings); //switch extra GPIOs to configured mode
+  setupGPIO(heishamonSettings.gpioSettings); // switch extra GPIOs to configured mode
 
-  //mosfet output enable
+  // mosfet output enable
   pinMode(5, OUTPUT);
 
-  //try to detect if cz-taw1 is connected in parallel
+  // try to detect if cz-taw1 is connected in parallel
   if (!heishamonSettings.listenonly) {
+
+    // clear serial buffer
+    while (Serial.read() >= 0) {
+      ;
+    }
+
+    // Wait some time to allow data to appear on the line
+    delay(5000);
+
     if (Serial.available() > 0) {
-      log_message(_F("There is data on the line without asking for it. Switching to listen only mode."));
+      log_message(F("There is data on the line without asking for it. Switching to listen only mode."));
       heishamonSettings.listenonly = true;
     }
     else {
-      //enable gpio15 after boot using gpio5 (D1) which enables the level shifter for the tx to panasonic
-      //do not enable if listen only to keep the line floating
+      // enable gpio15 after boot using gpio5 (D1) which enables the level shifter for the tx to panasonic
+      // do not enable if listen only to keep the line floating
       digitalWrite(5, HIGH);
     }
   }
 }
 
-void setupMqtt() {
+void setupMqtt()
+{
   mqtt_client.setBufferSize(1024);
-  mqtt_client.setSocketTimeout(10); mqtt_client.setKeepAlive(5); //fast timeout, any slower will block the main loop too long
+  mqtt_client.setSocketTimeout(10);
+  mqtt_client.setKeepAlive(5); // fast timeout, any slower will block the main loop too long
   mqtt_client.setServer(heishamonSettings.mqtt_server, atoi(heishamonSettings.mqtt_port));
   mqtt_client.setCallback(mqtt_callback);
 }
 
-void setupConditionals() {
-  //send_initial_query(); //maybe necessary but for now disable. CZ-TAW1 sends this query on boot
+void setupConditionals()
+{
+  // send_initial_query(); //maybe necessary but for now disable. CZ-TAW1 sends this query on boot
 
-  //load optional PCB data from flash
+  // load optional PCB data from flash
   if (heishamonSettings.optionalPCB) {
     if (loadOptionalPCB(optionalPCBQuery, OPTIONALPCBQUERYSIZE)) {
-      log_message(_F("Succesfully loaded optional PCB data from saved flash!"));
+      log_message(F("Succesfully loaded optional PCB data from saved flash!"));
     }
     else {
-      log_message(_F("Failed to load optional PCB data from flash!"));
+      log_message(F("Failed to load optional PCB data from flash!"));
     }
-    delay(1500); //need 1.5 sec delay before sending first datagram
-    send_optionalpcb_query(); //send one datagram already at start
+    delay(1500);              // need 1.5 sec delay before sending first datagram
+    send_optionalpcb_query(); // send one datagram already at start
     lastOptionalPCBRunTime = millis();
   }
 
-  //these two after optional pcb because it needs to send a datagram fast after boot
-  if (heishamonSettings.use_1wire) initDallasSensors(log_message, heishamonSettings.updataAllDallasTime, heishamonSettings.waitDallasTime, heishamonSettings.dallasResolution);
-  if (heishamonSettings.use_s0) initS0Sensors(heishamonSettings.s0Settings);
-
-
+  // these two after optional pcb because it needs to send a datagram fast after boot
+  if (heishamonSettings.use_1wire)
+    initDallasSensors(log_message, heishamonSettings.updataAllDallasTime, heishamonSettings.waitDallasTime, heishamonSettings.dallasResolution);
+  if (heishamonSettings.use_s0)
+    initS0Sensors(heishamonSettings.s0Settings);
 }
 
-void timer_cb(int nr) {
+void timer_cb(int nr)
+{
   if (nr > 0) {
     rules_timer_cb(nr);
-  } else {
+  }
+  else {
     switch (nr) {
-      case -1: {
-          LittleFS.begin();
-          LittleFS.format();
-          //create first boot file
-          File startupFile = LittleFS.open("/heishamon", "w");
-          startupFile.close(); 
-          WiFi.disconnect(true);
-          timerqueue_insert(1, 0, -2);
-        } break;
-      case -2: {
-          ESP.restart();
-        } break;
-      case -3: {
-          setupWifi(&heishamonSettings);
-        } break;
-      case -4: {
-          if (rules_parse("/rules.new") == -1) {
-            logprintln_P(F("new ruleset failed to parse, using previous ruleset"));
-            rules_parse("/rules.txt");
-          } else {
-            logprintln_P(F("new ruleset successfully parsed"));
-            if (LittleFS.begin()) {
-              LittleFS.rename("/rules.new", "/rules.txt");
-            }
-          }
-          rules_boot();
-        } break;
+    case -1:
+    {
+      LittleFS.begin();
+      LittleFS.format();
+      WiFi.disconnect(true);
+      timerqueue_insert(1, 0, -2);
+    }
+    break;
+    case -2:
+    {
+      ESP.restart();
+    }
+    break;
+    case -3:
+    {
+      setupWifi(&heishamonSettings);
+    }
+    break;
+    case -4:
+    {
+      if (rules_parse("/rules.new") == -1) {
+        logprintln_P(F("new ruleset failed to parse, using previous ruleset"));
+        rules_parse("/rules.txt");
+      }
+      else {
+        logprintln_P(F("new ruleset successfully parsed"));
+        if (LittleFS.begin()) {
+          LittleFS.rename("/rules.new", "/rules.txt");
+        }
+      }
+      rules_boot();
+    }
+    break;
     }
   }
-
 }
 
-void setup() {
-  //first get total memory before we do anything
+void setup()
+{
+  // first get total memory before we do anything
   getFreeMemory();
 
-  //set boottime
+  // set boottime
   char *up = getUptime();
   free(up);
 
@@ -1058,34 +1309,11 @@ void setup() {
   Serial.println(F("--- HEISHAMON ---"));
   Serial.println(F("starting..."));
 
-  //first boot check, to visually confirm good flash
-  if (LittleFS.begin()) {
-    if (LittleFS.exists("/heishamon")) {
-      //normal boot
-    } else if (LittleFS.exists("/config.json")) {
-      //from old firmware, create file and then normal boot
-      File startupFile = LittleFS.open("/heishamon", "w");
-      startupFile.close();    
-    } else {
-      //first boot
-      File startupFile = LittleFS.open("/heishamon", "w");
-      startupFile.close();    
-      pinMode(2, FUNCTION_0); //set it as gpio
-      pinMode(2, OUTPUT);
-      while (true) {
-        digitalWrite(2, HIGH);
-        delay(50);
-        digitalWrite(2, LOW);
-        delay(50);
-      }
-    }
-  }
-
-  //double reset detect from start
+  // double reset detect from start
   doubleResetDetect();
 
   WiFi.printDiag(Serial);
-  //initiate a wifi scan at boot to prefill the wifi scan json list
+  // initiate a wifi scan at boot to prefill the wifi scan json list
   byte numSsid = WiFi.scanNetworks();
   getWifiScanResults(numSsid);
 
@@ -1099,20 +1327,13 @@ void setup() {
   sntp_setoperatingmode(SNTP_OPMODE_POLL);
   sntp_init();
 
-  switchSerial(); //switch serial to gpio13/gpio15
+  switchSerial(); // switch serial to gpio13/gpio15
   WiFi.printDiag(Serial1);
 
-  setupConditionals(); //setup for routines based on settings
+  setupConditionals(); // setup for routines based on settings
 
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(DNS_PORT, "*", apIP);
-
-  //OT begin must be after serial setup
-  if (heishamonSettings.opentherm) {
-    //always enable mosfets if opentherm is used
-    digitalWrite(5, HIGH);
-    HeishaOTSetup();
-  }
 
   rst_info *resetInfo = ESP.getResetInfoPtr();
   Serial1.printf(PSTR("Reset reason: %d, exception cause: %d\n"), resetInfo->reason, resetInfo->exccause);
@@ -1125,62 +1346,55 @@ void setup() {
     if (LittleFS.begin()) {
       LittleFS.rename("/rules.old", "/rules.txt");
     }
-  } else {
+  }
+  else {
     rules_setup();
   }
 }
 
-void send_initial_query() {
-  log_message(_F("Requesting initial start query"));
+void send_initial_query()
+{
+  log_message(F("Requesting initial start query"));
   send_command(initialQuery, INITIALQUERYSIZE);
-
 }
 
-void send_panasonic_query() {
-  log_message(_F("Requesting new panasonic data"));
+void send_panasonic_query()
+{
+  log_message(F("Requesting new panasonic data"));
   send_command(panasonicQuery, PANASONICQUERYSIZE);
-  // rest is for the new data block on new models
-  if (extraDataBlockAvailable) {
-    log_message(_F("Requesting new panasonic extra data"));
-    panasonicQuery[3] = 0x21; //setting 4th byte to 0x21 is a request for extra block
-    send_command(panasonicQuery, PANASONICQUERYSIZE);
-    panasonicQuery[3] = 0x10; //setting 4th back to 0x10 for normal data request next time
-  } else if (!extraDataBlockChecked) {
-    if ((actData[0] == 0x71) && (actData[193] == 0) ) { //do we have data but 0 value in heat consumptiom power, then assume K or L series
-      extraDataBlockChecked = true;
-      log_message(_F("Checking if connected heatpump has extra data"));
-      panasonicQuery[3] = 0x21;
-      send_command(panasonicQuery, PANASONICQUERYSIZE);
-      panasonicQuery[3] = 0x10;   
-    }
-  }
 }
 
-void send_optionalpcb_query() {
-  log_message(_F("Sending optional PCB data"));
+void send_optionalpcb_query()
+{
+  log_message(F("Sending optional PCB data"));
   send_command(optionalPCBQuery, OPTIONALPCBQUERYSIZE);
 }
 
-
-void read_panasonic_data() {
+void read_panasonic_data()
+{
   if (sending && ((unsigned long)(millis() - sendCommandReadTime) > SERIALTIMEOUT)) {
-    log_message(_F("Previous read data attempt failed due to timeout!"));
-    sprintf_P(log_msg, PSTR("Received %d bytes data"), data_length);
+    log_message(F("Previous read data attempt failed due to timeout!"));
+    sprintf_P(log_msg, PSTR("Received %d bytes data"), serial_read_buffer_length);
     log_message(log_msg);
-    if (heishamonSettings.logHexdump) logHex(data, data_length);
-    if (data_length == 0) {
+    if (heishamonSettings.logHexdump)
+      logHex(serial_read_buffer, serial_read_buffer_length);
+    if (serial_read_buffer_length == 0) {
       timeoutread++;
-      totalreads++; //at at timeout we didn't receive anything but did expect it so need to increase this for the stats
-    } else {
+      totalreads++; // at at timeout we didn't receive anything but did expect it so need to increase this for the stats
+    }
+    else {
       tooshortread++;
     }
-    data_length = 0; //clear any data in array
-    sending = false; //receiving the answer from the send command timed out, so we are allowed to send a new command
+    serial_read_buffer_length = 0; // clear any data in array
+    sending = false;               // receiving the answer from the send command timed out, so we are allowed to send a new command
   }
-  if ( (heishamonSettings.listenonly || sending) && (Serial.available() > 0)) readSerial();
+
+  if ((heishamonSettings.listenonly || sending) && (Serial.available() > 0))
+    readSerial();
 }
 
-void loop() {
+void loop()
+{
   webserver_loop();
 
   // check wifi
@@ -1190,46 +1404,40 @@ void loop() {
 
   mqtt_client.loop();
 
-  if (heishamonSettings.opentherm) {
-    HeishaOTLoop(actData, mqtt_client, heishamonSettings.mqtt_topic_base);
-  }
-
   read_panasonic_data();
+  decode_panasonic_data();
 
-  if ((!sending) && (cmdnrel > 0)) { //check if there is a send command in the buffer
-    log_message(_F("Sending command from buffer"));
+  publish_available_data();
+  publish_crash_report();
+
+  if ((!sending) && (cmdnrel > 0)) { // check if there is a send command in the buffer
+    log_message(F("Sending command from buffer"));
     popCommandBuffer();
   }
 
-  if (heishamonSettings.use_1wire) dallasLoop(mqtt_client, log_message, heishamonSettings.mqtt_topic_base);
+  if (heishamonSettings.use_1wire)
+    dallasLoop(mqtt_client, log_message, heishamonSettings.mqtt_topic_base);
 
-  if (heishamonSettings.use_s0) s0Loop(mqtt_client, log_message, heishamonSettings.mqtt_topic_base, heishamonSettings.s0Settings);
+  if (heishamonSettings.use_s0)
+    s0Loop(mqtt_client, log_message, heishamonSettings.mqtt_topic_base, heishamonSettings.s0Settings);
 
-  if ((!sending) && (!heishamonSettings.listenonly) && (heishamonSettings.optionalPCB) && ((unsigned long)(millis() - lastOptionalPCBRunTime) > OPTIONALPCBQUERYTIME) ) {
+  if ((!sending) && (!heishamonSettings.listenonly) && (heishamonSettings.optionalPCB) && ((unsigned long)(millis() - lastOptionalPCBRunTime) > OPTIONALPCBQUERYTIME)) {
     lastOptionalPCBRunTime = millis();
     send_optionalpcb_query();
-    if ((unsigned long)(millis() - lastOptionalPCBSave) > (1000 * OPTIONALPCBSAVETIME)) {  // only save each 5 minutes
-      lastOptionalPCBSave = millis();
-      if (saveOptionalPCB(optionalPCBQuery, OPTIONALPCBQUERYSIZE)) {
-        log_message((char*)"Succesfully saved optional PCB data to flash!");
-      } else {
-        log_message((char*)"Failed to save optional PCB data to flash!");
-      }
-    }
   }
 
   // run the data query only each WAITTIME
   if ((unsigned long)(millis() - lastRunTime) > (1000 * heishamonSettings.waitTime)) {
     lastRunTime = millis();
-    //check mqtt
-    if ( (WiFi.isConnected()) && (!mqtt_client.connected()) )
-    {
-      log_message(_F("Lost MQTT connection!"));
+    // check mqtt
+    if ((WiFi.isConnected()) && (!mqtt_client.connected())) {
+      log_message(F("Lost MQTT connection!"));
       mqtt_reconnect();
     }
 
-    //log stats
-    if (totalreads > 0 ) readpercentage = (((float)goodreads / (float)totalreads) * 100);
+    // log stats
+    if (totalreads > 0)
+      readpercentage = (((float)goodreads / (float)totalreads) * 100);
     String message;
     message.reserve(384);
     message += F("Heishamon stats: Uptime: ");
@@ -1253,7 +1461,7 @@ void loop() {
     message += F(" ## Correct data: ");
     message += readpercentage;
     message += F("%");
-    log_message((char*)message.c_str());
+    log_message((char *)message.c_str());
 
     String stats;
     stats.reserve(384);
@@ -1283,16 +1491,15 @@ void loop() {
     stats += toolongread;
     stats += F(",\"timeout reads\":");
     stats += timeoutread;
-    stats += F(",\"version\":\"");
-    stats += heishamon_version;
-    stats += F("\"}");
+    stats += F("}");
     sprintf_P(mqtt_topic, PSTR("%s/stats"), heishamonSettings.mqtt_topic_base);
     mqtt_client.publish(mqtt_topic, stats.c_str(), MQTT_RETAIN_VALUES);
 
-    //get new data
-    if (!heishamonSettings.listenonly) send_panasonic_query();
+    // get new data
+    if (!heishamonSettings.listenonly)
+      send_panasonic_query();
 
-    //Make sure the LWT is set to Online, even if the broker have marked it dead.
+    // Make sure the LWT is set to Online, even if the broker have marked it dead.
     sprintf_P(mqtt_topic, PSTR("%s/%s"), heishamonSettings.mqtt_topic_base, mqtt_willtopic);
     mqtt_client.publish(mqtt_topic, "Online");
 
